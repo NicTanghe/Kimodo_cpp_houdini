@@ -1,0 +1,10 @@
+build/
+*.o
+*.so
+*.so.*
+*.a
+*.dso
+*.glb
+*.bvh
+.DS_Store
+compile_commands.json
