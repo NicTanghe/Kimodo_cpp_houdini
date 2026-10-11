@@ -36,63 +36,109 @@ Direct GU_Detail KineFX Skeleton Output:
 - `scripts/build_hcustom.sh` — Compiles `libkimodo.so` and installs `SOP_Kimodo.so` into `$HOME/houdini21.X/dso/` via Houdini's `hcustom`.
 - `tests/test_pipeline.cpp` — C++ test suite verifying `libkimodo.so` C-API linkage, SOMA-30 Forward Kinematics, KineFX transform matrices, and binary `.glb` / `.bvh` generation.
 
-## Building & Testing (Linux)
+---
 
-### 1. Build `libkimodo.so`, `kimodo_cli`, and C++ Tests via CMake
+## Installation Guide (Houdini 21+ on Linux)
+
+### Step 1: Download the GGUF Model Weights
+
+If you haven't downloaded the native GGUF weights yet, run `download_gguf_weights.sh` from your `kimodo.cpp` directory:
 
 ```bash
+cd /home/dude/dev/Houdini_motionAI/kimodo.cpp
+./scripts/download_gguf_weights.sh --output "$PWD" --model soma-rp-v1.1
+```
+
+This downloads:
+- **Motion model**: `/home/dude/dev/Houdini_motionAI/kimodo.cpp/models/kimodo-soma-rp-v1.1-f32.gguf`
+- **Text encoder bundle**: `q8_0` weights + `tokenizer.gguf` in `/home/dude/dev/Houdini_motionAI/kimodo.cpp/models/`
+
+*(Optional)* You can also download `soma-seed-v1.1`, `g1-rp-v1`, or `g1-seed-v1` by passing additional `--model` flags.
+
+---
+
+### Step 2: Compile & Install the Houdini 21+ DSO (`SOP_Kimodo.so`)
+
+You can build and install the plugin using either `build_hcustom.sh` or CMake + Ninja.
+
+#### Option A: Using `scripts/build_hcustom.sh` (Recommended)
+
+Point `HFS` to your Houdini 21+ installation (defaults to `/opt/hfs21*`) and run:
+
+```bash
+cd /home/dude/dev/Houdini_motionAI/kimodo_houdini
+HFS=/opt/hfs21.0 ./scripts/build_hcustom.sh
+```
+
+What this script does:
+1. Compiles `build/libkimodo.so` with `-fPIC` and embeds the runtime `RPATH` for `libggml.so` and `libggml-vulkan.so`.
+2. Sources `$HFS/houdini_setup` and compiles `src/SOP_Kimodo.C` via `hcustom`.
+3. Installs the compiled plugin directly into `~/houdini21.0/dso/SOP_Kimodo.so`.
+4. Verifies dynamic library resolution using `ldd`.
+
+#### Option B: Using CMake + Ninja
+
+```bash
+source /opt/hfs21.0/houdini_setup
+cd /home/dude/dev/Houdini_motionAI/kimodo_houdini
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-If Houdini 21+ is installed in `/opt/hfs21.*` or `$HFS` is set in your environment, CMake automatically detects `$HFS/toolkit/cmake` and builds `SOP_Kimodo.so`.
+When `HFS` is active in your shell, `CMakeLists.txt` detects `$HFS/toolkit/cmake` and runs `houdini_configure_target(SOP_Kimodo)`, installing `SOP_Kimodo.so` into `~/houdini21.0/dso/`.
 
-### 2. Compile & Install `SOP_Kimodo.so` via `hcustom` (Houdini 21+)
-
-```bash
-source /opt/hfs21.0/houdini_setup
-./scripts/build_hcustom.sh
-```
-
-Verify symbol linkage on the installed DSO:
+#### Verify DSO Linkage
 
 ```bash
 ldd $HOME/houdini21*/dso/SOP_Kimodo.so | grep -i -E "kimodo|ggml"
 ```
 
-### 3. Standalone C++ CLI (`kimodo_cli`)
+---
+
+### Step 3: Use Inside Houdini 21+
+
+1. Launch `houdini`.
+2. Create a **Geometry (`/obj/geo1`)** node and dive inside.
+3. Press <kbd>Tab</kbd> and create **Kimodo Native** (`sop_kimodo_native`).
+4. Configure the node parameters:
+   - **Motion GGUF Path**: `/home/dude/dev/Houdini_motionAI/kimodo.cpp/models/kimodo-soma-rp-v1.1-f32.gguf`
+   - **Text Encoder GGUF / Bundle**: Path to your downloaded LLM2Vec GGUF file (or leave empty to test denoiser-only zero-embedding mode)
+   - **Compute Backend**: `Auto (Vulkan / CPU)`, `CPU`, or `Vulkan GPU`
+   - **Text Prompt**: e.g., `A person walking forward and waving`
+   - **Frame Count / Diffusion Steps / Seed**: Adjust as needed (motion is cached across timeline scrubbing and only re-runs when generation parameters change).
+5. Connect the output into your KineFX retargeting graph:
+
+```
+[ Kimodo Native (SOP_Kimodo) ]
+         │  (Outputs KineFX skeleton: P, 3@transform, 4@localtransform, p@rot, s@name, bone lines)
+         ▼
+[ Skeleton Rename SOP ]    <-- Optional: map SOMA-30 / SMPL-X 22 / G1-34 joint names to target rig
+         │
+         ▼
+[ Rig Match Pose SOP ]     <-- Align rest / T-pose with target production character
+         │
+         ▼
+[ Character Retarget SOP ] <-- Solve animated motion onto target character rig
+         │
+         ▼
+[ Bone Deform SOP ]        <-- Deform character mesh
+```
+
+---
+
+## Standalone C++ CLI (`kimodo_cli`)
 
 You can also generate standalone `.glb` or `.bvh` files from C++ without launching Houdini:
 
 ```bash
 ./build/kimodo_cli \
-  --model /path/to/kimodo-soma-rp-v1.1-f32.gguf \
-  --text-model /path/to/llm2vec-q8_0.gguf \
+  --model /home/dude/dev/Houdini_motionAI/kimodo.cpp/models/kimodo-soma-rp-v1.1-f32.gguf \
+  --text-model /home/dude/dev/Houdini_motionAI/kimodo.cpp/models/llm2vec-q8_0.gguf \
   --prompt "A person walking forward and waving" \
   --frames 60 \
   --steps 50 \
   --seed 42 \
   --output-glb /tmp/animation.glb \
   --output-bvh /tmp/animation.bvh
-```
-
-## KineFX Downstream Graph in Houdini 21+
-
-Drop **Kimodo Native** (`sop_kimodo_native`) into any `/obj/geo` network:
-
-```
-[ Kimodo Native (SOP_Kimodo) ]
-         │  (Outputs KineFX skeleton: P, 3@transform, 4@localtransform, p@rot, s@name, bone lines)
-         ▼
-[ Skeleton Rename SOP ]   <-- Optional: map SOMA-30 / SMPL-X 22 / G1-34 joint names to target rig
-         │
-         ▼
-[ Rig Match Pose SOP ]    <-- Align rest / T-pose with target production character
-         │
-         ▼
-[ Character Retarget SOP ] <-- Solve animated motion onto target character rig
-         │
-         ▼
-[ Bone Deform SOP ]       <-- Deform character mesh
 ```
