@@ -91,9 +91,12 @@ set_target_properties(kimodo_cli PROPERTIES
 if(DEFINED ENV{HFS} AND EXISTS "$ENV{HFS}/toolkit/cmake")
     list(APPEND CMAKE_PREFIX_PATH "$ENV{HFS}/toolkit/cmake")
 else()
-    file(GLOB HFS21_DIRS "/opt/hfs21*")
-    foreach(HFS_CANDIDATE ${HFS21_DIRS})
-        if(EXISTS "${HFS_CANDIDATE}/toolkit/cmake")
+    file(GLOB HFS_DIRS "/opt/hfs*")
+    list(SORT HFS_DIRS COMPARE NATURAL ORDER DESCENDING)
+    foreach(HFS_CANDIDATE ${HFS_DIRS})
+        get_filename_component(HFS_NAME "${HFS_CANDIDATE}" NAME)
+        if(HFS_NAME MATCHES "^hfs([0-9]+)" AND CMAKE_MATCH_1 GREATER_EQUAL 21
+           AND EXISTS "${HFS_CANDIDATE}/toolkit/cmake")
             list(APPEND CMAKE_PREFIX_PATH "${HFS_CANDIDATE}/toolkit/cmake")
         endif()
     endforeach()
@@ -114,15 +117,22 @@ if(Houdini_FOUND)
         BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${GGML_LIB_DIR};${GGML_VK_LIB_DIR}"
         INSTALL_RPATH "${CMAKE_CURRENT_BINARY_DIR};${GGML_LIB_DIR};${GGML_VK_LIB_DIR}"
     )
-    houdini_configure_target(SOP_Kimodo)
+    set(KIMODO_DSO_DIR "" CACHE PATH "Override Houdini DSO output directory (empty uses Houdini's user directory)")
+    if(KIMODO_DSO_DIR)
+        houdini_configure_target(SOP_Kimodo INSTDIR "${KIMODO_DSO_DIR}")
+    else()
+        houdini_configure_target(SOP_Kimodo)
+    endif()
 else()
-    message(STATUS "Houdini 21+ HDK not found in environment (set HFS=/opt/hfs21.0 or run scripts/build_hcustom.sh)")
+    message(STATUS "Houdini 21+ HDK not found in environment (set HFS to your Houdini installation or run scripts/build_hcustom.sh)")
 endif()
 
 # 4. C++ Verification Tests
 enable_testing()
 add_executable(kimodo_houdini_test tests/test_pipeline.cpp)
 target_link_libraries(kimodo_houdini_test PRIVATE kimodo_houdini_core)
+# The tests use assert; keep checks enabled in Release and RelWithDebInfo builds.
+target_compile_options(kimodo_houdini_test PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
 set_target_properties(kimodo_houdini_test PROPERTIES
     BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${GGML_LIB_DIR};${GGML_VK_LIB_DIR}"
 )

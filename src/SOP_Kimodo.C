@@ -47,10 +47,10 @@ static PRM_Name prmConstraintCfg("constraint_cfg", "Constraint CFG Weight");
 static PRM_Default prmConstraintCfgDef(2.0f);
 
 static PRM_Name prmMotionModel("motion_model", "Motion GGUF Path");
-static PRM_Default prmMotionModelDef(0.0, "/opt/kimodo.cpp/models/kimodo-soma-rp-v1.1-f32.gguf");
+static PRM_Default prmMotionModelDef(0.0, "$KIMODO_MODEL_DIR/models/kimodo-soma-rp-v1.1-f32.gguf");
 
 static PRM_Name prmTextModel("text_model", "Text Encoder GGUF / Bundle");
-static PRM_Default prmTextModelDef(0.0, "/opt/kimodo.cpp/models/llm2vec-q8_0.gguf");
+static PRM_Default prmTextModelDef(0.0, "$KIMODO_MODEL_DIR/Llama-3-Kimodo-Q8_0.gguf");
 
 static PRM_Name prmDevice("device", "Compute Backend");
 static PRM_Default prmDeviceDef(0); // 0 = Auto, 1 = CPU, 2 = Vulkan
@@ -79,12 +79,12 @@ PRM_Template SOP_Kimodo::myTemplateList[] = {
     PRM_Template()
 };
 
-OP_Node *SOP_Kimodo::myConstructor(OP_Network *net, const char *name, OP_Parameters *params) {
-    return new SOP_Kimodo(net, name, params);
+OP_Node *SOP_Kimodo::myConstructor(OP_Network *net, const char *name, OP_Operator *entry) {
+    return new SOP_Kimodo(net, name, entry);
 }
 
-SOP_Kimodo::SOP_Kimodo(OP_Network *net, const char *name, OP_Parameters *params)
-    : SOP_Node(net, name, params) {}
+SOP_Kimodo::SOP_Kimodo(OP_Network *net, const char *name, OP_Operator *entry)
+    : SOP_Node(net, name, entry) {}
 
 SOP_Kimodo::~SOP_Kimodo() = default;
 
@@ -215,7 +215,7 @@ OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
             if (sj >= skel->joint_count()) continue;
             const int parent_idx = skel->parents[sj];
             if (parent_idx >= 0 && parent_idx < num_joints) {
-                GEO_PrimPoly *bone_line = GEO_PrimPoly::build(gdp, 2, GU_POLY_OPEN);
+                GEO_PrimPoly *bone_line = GEO_PrimPoly::build(gdp, 2, GU_POLY_OPEN, false);
                 bone_line->setPointOffset(0, joint_ptoffs[static_cast<std::size_t>(parent_idx)]);
                 bone_line->setPointOffset(1, joint_ptoffs[sj]);
             }
@@ -232,7 +232,7 @@ void newSopOperator(OP_OperatorTable *table) {
         "Kimodo Native",
         SOP_Kimodo::myConstructor,
         SOP_Kimodo::myTemplateList,
-        0,
-        0 // Pure text-to-motion generator SOP requires 0 geometric inputs
+        0u,
+        0u // Pure text-to-motion generator SOP requires 0 geometric inputs
     ));
 }
