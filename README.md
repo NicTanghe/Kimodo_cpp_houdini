@@ -48,7 +48,7 @@ Run these commands from the `Kimodo_cpp_houdini` folder:
 export PLUGIN_DIR="$PWD"
 export KIMODO_CPP_DIR="$(dirname "$PLUGIN_DIR")/kimodo.cpp"
 export KIMODO_CPP_BUILD_DIR="$KIMODO_CPP_DIR/build"
-export HFS=/opt/hfs22.0.459  # Change to the Houdini installation you want to use.
+export HFS=/opt/hfs22.0  # Change to the Houdini installation you want to use.
 ```
 
 The plugin and [`kimodo.cpp`](https://github.com/localai-org/kimodo.cpp) are
@@ -59,15 +59,19 @@ git clone --recurse-submodules https://github.com/localai-org/kimodo.cpp.git "$K
 git -C "$KIMODO_CPP_DIR" checkout 5679ff19ba0a522c0b0516e9a9d402fe1af2c027
 git -C "$KIMODO_CPP_DIR" submodule update --init --recursive
 git -C "$KIMODO_CPP_DIR" apply "$PLUGIN_DIR/patches/kimodo-split-backends.patch"
+git -C "$KIMODO_CPP_DIR" apply "$PLUGIN_DIR/patches/kimodo-constraints.patch"
 ```
 
 This integration was built against kimodo.cpp commit
-`5679ff19ba0a522c0b0516e9a9d402fe1af2c027` with Houdini 22.0.459 on Linux.
+`5679ff19ba0a522c0b0516e9a9d402fe1af2c027` with Houdini 22.0.473 on Linux.
 CMake 3.25+, a C++23-capable compiler, Make, and Git are required. Ninja is optional.
-The bundled dependency patch makes the C API honor the motion-device selector,
+The backend dependency patch makes the C API honor the motion-device selector,
 adds `KIMODO_TEXT_BACKEND` independently of the motion backend, and fixes model
 manifest verification matching unrelated tokenizer paths. Apply it once to the
-pinned checkout above.
+pinned checkout above. The second patch exposes conditioned sampling through the
+C API. If upgrading a checkout with the backend patch already applied, apply only
+`patches/kimodo-constraints.patch`, then rebuild the plugin. Do not apply either
+patch twice.
 
 For **GPU motion + CPU text**, install `libvulkan-dev`, `glslc`, and
 `spirv-headers` using your distribution's package manager, then build:
@@ -195,8 +199,9 @@ For CLI use, export `KIMODO_TEXT_BACKEND=cpu` before launching the CLI.
    - **Text Encoder GGUF / Bundle**: `${KIMODO_CPP_DIR}/Llama-3-Kimodo-Q8_0.gguf` (leaving this empty runs denoiser-only zero-embedding mode and ignores the prompt)
    - **Compute Backend**: choose `Vulkan GPU` for GPU motion with CPU text; choose `CPU` for CPU-only builds.
    - **Text Prompt**: e.g., `A person walking forward and waving`
-   - **Frame Count / Diffusion Steps / Seed**: Adjust as needed (motion is cached across timeline scrubbing and only re-runs when generation parameters change).
-5. Connect the output into your KineFX retargeting graph:
+   - **Frame Count / Diffusion Steps / Seed**: Adjust as needed (edits do not regenerate motion; press Generate explicitly).
+5. Press **Generate**. Scrubbing and parameter edits retain that clip until the next button click.
+6. Connect the output into your KineFX retargeting graph:
 
 ```
 [ Kimodo Native (SOP_Kimodo) ]
@@ -215,6 +220,100 @@ For CLI use, export `KIMODO_TEXT_BACKEND=cpu` before launching the CLI.
 ```
 
 ---
+
+## Pose capture, in-betweening, and paths
+
+Create **Kimodo Skeleton** (`sop_kimodo_skeleton`) for a model-matched SOMA 30,
+SMPL-X 22, or G1 34 rest skeleton. It requires no model and performs no inference.
+It outputs named joints, parent-child bone lines, `transform`, `localtransform`,
+`rot`, and `parent`, with matrix/quaternion type metadata. Adjust **Root Height**
+and animate it using Rig Pose or other native KineFX tools.
+
+Connect the animated skeleton to **input 0** of **Kimodo Native**, and waypoint
+points to **input 1**. Choose the matching **Skeleton** on both nodes and a motion
+model for that skeleton. Captures are matched by joint `name`, not point order.
+All positions are SOP-space, Y-up, in meters. Use Object Merge transforms when
+bringing inputs from different objects. The model produces 30 motion samples per
+second; a 30 FPS Houdini scene plays those samples at their intended speed.
+
+### Input 0: capture animation at chosen frames
+
+**Start Frame** and **Frame Count** define the output clip interval. Capture and
+waypoint frames are absolute Houdini frame numbers within that interval. For
+example, Start Frame 101 and Frame Count 60 give frames 101 through 160.
+
+Set **Capture Frames From** to the UI list, detail attribute, or their union:
+
+- **Capture Frames** accepts a list such as `1 30 60`, inclusive ranges such as
+  `1-10 51-60`, or stepped ranges such as `1-60:5`. Commas are also accepted.
+- The default detail attribute is **`kimodo_capture_frames`**. It can be an
+  integer array or a string using the same range syntax. For a Detail Wrangle:
+
+  ```c
+  i[]@kimodo_capture_frames = array(1, 30, 60);
+  ```
+
+The node cooks input 0 separately at every selected frame **when Generate is
+pressed** and snapshots the poses. It does not use the currently displayed pose
+for every capture. An empty list means no pose constraints; frame numbers without
+input 0 are rejected. Duplicate capture frames are merged.
+
+For in-betweening, capture the beginning and ending poses, or ranges at both ends
+(e.g. `1-10 51-60`), then let Kimodo generate the motion between them.
+
+**Full Body** constrains all joint positions and the root position/heading, as in
+NVIDIA's FullBodyConstraintSet. **Selected Joints** uses a named **Joint Point
+Group** on input 0; create that group with native Group tools. The full named
+skeleton must remain present. Selected positions are constrained, and enabling
+**Constrain Selected Joint Rotations** also reads their world-space KineFX
+`transform` matrices. Root position/heading are constrained in this mode too, as
+required by the smooth-root representation. Hand and foot constraints are the
+principal trained use case; arbitrary joint selections are accepted but have not
+been separately quality-benchmarked.
+
+### Input 1: timed waypoints or a dense path
+
+Each point requires:
+
+| Attribute | Type | Meaning |
+| --- | --- | --- |
+| `P` | vector | Target smooth-root position; X and Z are used, Y is ignored |
+| `frame` | scalar integer | Absolute Houdini frame at which to reach the waypoint |
+| `heading` | optional scalar float | Facing angle in radians; zero is forward +Z |
+
+Point order is irrelevant; timing comes from `frame`. Duplicate or out-of-range
+waypoint frames are rejected. **Sparse Waypoints** only constrains those frames.
+**Dense Path** linearly interpolates X/Z at every frame and requires waypoints on
+the first and last clip frames. If heading is present it interpolates along the
+shortest angular arc.
+
+Pose and waypoint constraints can be combined. A pose capture constrains the
+smooth root to its pelvis X/Z; a waypoint at the same frame must agree with that
+position. Conflicting constraints produce a warning and keep the previous clip.
+
+### Generate and retain results
+
+Only **Generate** runs inference. Creating the node, changing prompts/settings,
+editing either input, scrubbing, and force-recooking do not generate a new clip.
+Pressing Generate again uses the current inputs/settings even with the same seed.
+A failed generation keeps the last successful output and reports a warning.
+Without a clip the node displays a rest skeleton and asks you to Generate.
+
+`kimodo_generation` and `kimodo_clip_frames` detail attributes report the current
+successful generation count and cached clip length. The clip is held in memory,
+not serialized in the HIP file. Use a downstream **File Cache** to retain generated
+animation across Houdini sessions; reopening an uncached graph requires pressing
+Generate again. The separate skeleton and all authored keyframes remain normal
+Houdini scene data.
+
+Conditioning enters the model's constraint CFG branch at every diffusion step.
+These are learned constraints, not hard IK locks: generated poses may deviate,
+and smooth-root waypoints do not guarantee the pelvis hits the exact X/Z target.
+There is no post-generation snapping disguised as model conditioning. See
+[NVIDIA's constraint concepts](https://research.nvidia.com/labs/sil/projects/kimodo/docs/key_concepts/constraints.html).
+Multi-prompt stitching, upstream postprocessing/IK, and 77-joint SOMA expansion
+are not exposed by this node.
+
 
 ## Standalone C++ CLI (`kimodo_cli`)
 
@@ -248,3 +347,15 @@ The profile output should show `text.backend=CPU` and `motion.backend=Vulkan0`.
 The check verifies real inference, skeleton topology, attributes, finite positions,
 and timeline updates. It uses only four diffusion steps as a smoke test; increase
 the node's diffusion steps for production animation.
+
+Run the input-workflow regression (with CPU text and GPU motion):
+
+```bash
+KIMODO_TEXT_BACKEND=cpu "$HFS/bin/hython" tests/houdini_constraints.py \
+  --models "$KIMODO_CPP_DIR" --save /tmp/kimodo_constraints_example.hip
+```
+
+It checks UI/array/string frame capture, full and selected-joint constraints,
+waypoints and dense paths, button-only generation, and preservation of the last
+clip after invalid input. The saved authoring network requires Generate after
+opening because the inference cache is not serialized.

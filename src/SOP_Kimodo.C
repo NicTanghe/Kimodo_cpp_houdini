@@ -20,149 +20,28 @@
 #include <string>
 #include <vector>
 
-// Compatibility aliases matching the PDF reference snippet naming
-using GA_RWHandle_S = GA_RWHandleS;
-using GA_RWHandle_V4 = GA_RWHandleV4;
+#include <OP/OP_AutoLockInputs.h>
+#include <GA/GA_ElementGroup.h>
+#include <kimodo_houdini/constraints.hpp>
+#include <map>
+#include <set>
+#include <utility>
 
-// Parameter UI definitions
-static PRM_Name prmPrompt("prompt", "Text Prompt");
-static PRM_Default prmPromptDef(0.0, "A person walking forward and waving");
-
-static PRM_Name prmFrames("frames", "Frame Count");
-static PRM_Default prmFramesDef(60);
-static PRM_Range prmFramesRange(PRM_RANGE_RESTRICTED, 1, PRM_RANGE_UI, 300);
-
-static PRM_Name prmSteps("steps", "Diffusion Steps");
-static PRM_Default prmStepsDef(50);
-static PRM_Range prmStepsRange(PRM_RANGE_RESTRICTED, 1, PRM_RANGE_UI, 100);
-
-static PRM_Name prmSeed("seed", "Seed");
-static PRM_Default prmSeedDef(42);
-
-static PRM_Name prmTextCfg("text_cfg", "Text CFG Weight");
-static PRM_Default prmTextCfgDef(2.0f);
-static PRM_Range prmCfgRange(PRM_RANGE_RESTRICTED, 0.0f, PRM_RANGE_UI, 10.0f);
-
-static PRM_Name prmConstraintCfg("constraint_cfg", "Constraint CFG Weight");
-static PRM_Default prmConstraintCfgDef(2.0f);
-
-static PRM_Name prmMotionModel("motion_model", "Motion GGUF Path");
-static PRM_Default prmMotionModelDef(0.0, "$KIMODO_MODEL_DIR/models/kimodo-soma-rp-v1.1-f32.gguf");
-
-static PRM_Name prmTextModel("text_model", "Text Encoder GGUF / Bundle");
-static PRM_Default prmTextModelDef(0.0, "$KIMODO_MODEL_DIR/Llama-3-Kimodo-Q8_0.gguf");
-
-static PRM_Name prmDevice("device", "Compute Backend");
-static PRM_Default prmDeviceDef(0); // 0 = Auto, 1 = CPU, 2 = Vulkan
-static PRM_Name prmDeviceChoices[] = {
-    PRM_Name("auto", "Auto (Vulkan / CPU)"),
-    PRM_Name("cpu", "CPU"),
-    PRM_Name("vulkan", "Vulkan GPU"),
-    PRM_Name(nullptr)
-};
-static PRM_ChoiceList prmDeviceMenu(PRM_CHOICELIST_SINGLE, prmDeviceChoices);
-
-static PRM_Name prmConnectBones("connect_bones", "Create KineFX Bone Lines");
-static PRM_Default prmConnectBonesDef(1);
-
-PRM_Template SOP_Kimodo::myTemplateList[] = {
-    PRM_Template(PRM_STRING, 1, &prmPrompt, &prmPromptDef),
-    PRM_Template(PRM_INT_J,  1, &prmFrames, &prmFramesDef, nullptr, &prmFramesRange),
-    PRM_Template(PRM_INT_J,  1, &prmSteps,  &prmStepsDef,  nullptr, &prmStepsRange),
-    PRM_Template(PRM_INT_J,  1, &prmSeed,   &prmSeedDef),
-    PRM_Template(PRM_FLT_J,  1, &prmTextCfg, &prmTextCfgDef, nullptr, &prmCfgRange),
-    PRM_Template(PRM_FLT_J,  1, &prmConstraintCfg, &prmConstraintCfgDef, nullptr, &prmCfgRange),
-    PRM_Template(PRM_FILE,   1, &prmMotionModel, &prmMotionModelDef),
-    PRM_Template(PRM_FILE,   1, &prmTextModel,   &prmTextModelDef),
-    PRM_Template(PRM_ORD,    1, &prmDevice,      &prmDeviceDef, &prmDeviceMenu),
-    PRM_Template(PRM_TOGGLE, 1, &prmConnectBones, &prmConnectBonesDef),
-    PRM_Template()
-};
-
-OP_Node *SOP_Kimodo::myConstructor(OP_Network *net, const char *name, OP_Operator *entry) {
-    return new SOP_Kimodo(net, name, entry);
-}
-
-SOP_Kimodo::SOP_Kimodo(OP_Network *net, const char *name, OP_Operator *entry)
-    : SOP_Node(net, name, entry) {}
-
-SOP_Kimodo::~SOP_Kimodo() = default;
-
-OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
-    // Flag node as time-dependent across the Houdini timeline
-    flags().setTimeDep(true);
+namespace {
+using namespace kimodo_houdini;
+void write_skeleton(GU_Detail *gdp, const std::vector<JointPose>& poses, const SkeletonDef *skel, bool connect_bones) {
     gdp->clearAndDestroy();
-
-    const fpreal t = context.getTime();
-    const fpreal curr_frame = context.getFrame();
-
-    UT_String prompt_ut;
-    evalString(prompt_ut, "prompt", 0, t);
-
-    UT_String motion_model_ut;
-    evalString(motion_model_ut, "motion_model", 0, t);
-
-    UT_String text_model_ut;
-    evalString(text_model_ut, "text_model", 0, t);
-
-    const int total_frames = SYSmax(1, static_cast<int>(evalInt("frames", 0, t)));
-    const int steps = SYSmax(1, static_cast<int>(evalInt("steps", 0, t)));
-    const int seed = static_cast<int>(evalInt("seed", 0, t));
-    const float text_cfg = static_cast<float>(evalFloat("text_cfg", 0, t));
-    const float constraint_cfg = static_cast<float>(evalFloat("constraint_cfg", 0, t));
-    const int device_ord = static_cast<int>(evalInt("device", 0, t));
-    const bool connect_bones = evalInt("connect_bones", 0, t) != 0;
-
-    kimodo_houdini::ModelConfig model_cfg{};
-    model_cfg.motion_gguf = motion_model_ut.c_str() ? motion_model_ut.c_str() : "";
-    model_cfg.text_gguf = text_model_ut.c_str() ? text_model_ut.c_str() : "";
-    if (device_ord == 1) {
-        model_cfg.device = KIMODO_DEVICE_CPU;
-    } else if (device_ord == 2) {
-        model_cfg.device = KIMODO_DEVICE_VULKAN;
-    } else {
-        model_cfg.device = KIMODO_DEVICE_AUTO;
-    }
-
-    kimodo_houdini::GenerationParams gen_params{};
-    gen_params.prompt = prompt_ut.c_str() ? prompt_ut.c_str() : "";
-    gen_params.frames = static_cast<std::uint32_t>(total_frames);
-    gen_params.diffusion_steps = static_cast<std::uint32_t>(steps);
-    gen_params.seed = static_cast<std::uint64_t>(seed >= 0 ? seed : 0);
-    gen_params.text_cfg_weight = text_cfg;
-    gen_params.constraint_cfg_weight = constraint_cfg;
-
-    // 1 & 2. Lazy-load GGUF weights and run/retrieve cached diffusion motion
-    std::string err_msg;
-    const kimodo_motion *motion = mySessionCache.get_or_generate(model_cfg, gen_params, err_msg);
-    if (!motion) {
-        addError(SOP_MESSAGE, err_msg.c_str());
-        return error();
-    }
-
-    const int out_frames = kimodo_motion_frames(motion);
-    const int num_joints = kimodo_motion_joints(motion);
-    const float *root_positions = kimodo_motion_root_positions(motion);
-    const float *local_rotations = kimodo_motion_local_rotations_xyzw(motion);
-
-    if (out_frames <= 0 || num_joints <= 0 || !root_positions || !local_rotations) {
-        addError(SOP_MESSAGE, "kimodo_motion returned empty frame or joint buffers");
-        return error();
-    }
-
-    const int frame_idx = SYSclamp(static_cast<int>(curr_frame) - 1, 0, out_frames - 1);
-    const kimodo_houdini::SkeletonDef *skel = kimodo_houdini::find_skeleton_by_joints(num_joints);
-
-    const std::vector<kimodo_houdini::JointPose> poses = kimodo_houdini::evaluate_frame_fk(
-        frame_idx, out_frames, num_joints, root_positions, local_rotations, skel);
-
+    const int num_joints=static_cast<int>(poses.size());
     // 3. Register KineFX attributes on geometry (Houdini 21+ KineFX standard)
-    GA_RWHandle_S name_handle(gdp->addStringTuple(GA_ATTRIB_POINT, "name", 1));
-    GA_RWHandle_V4 rot_handle(gdp->addFloatTuple(GA_ATTRIB_POINT, "rot", 4)); // Quat [x, y, z, w]
+    GA_RWHandleS name_handle(gdp->addStringTuple(GA_ATTRIB_POINT, "name", 1));
+    GA_RWHandleV4 rot_handle(gdp->addFloatTuple(GA_ATTRIB_POINT, "rot", 4)); // Quat [x, y, z, w]
     GA_RWHandleM3 transform_handle(gdp->addFloatTuple(GA_ATTRIB_POINT, "transform", 9)); // 3x3 world rotation
     GA_RWHandleM4 localtransform_handle(gdp->addFloatTuple(GA_ATTRIB_POINT, "localtransform", 16)); // 4x4 local transform
     GA_RWHandleI parent_handle(gdp->addIntTuple(GA_ATTRIB_POINT, "parent", 1));
 
+    gdp->findPointAttribute("transform")->setTypeInfo(GA_TYPE_TRANSFORM);
+    gdp->findPointAttribute("localtransform")->setTypeInfo(GA_TYPE_TRANSFORM);
+    gdp->findPointAttribute("rot")->setTypeInfo(GA_TYPE_QUATERNION);
     // 4. Construct skeleton points in native gdp (GU_Detail)
     std::vector<GA_Offset> joint_ptoffs(static_cast<std::size_t>(num_joints));
     for (int j = 0; j < num_joints; ++j) {
@@ -222,17 +101,189 @@ OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
         }
     }
 
-    return error();
+}
+const SkeletonDef *selected_skeleton(int selection) {
+    return find_skeleton_by_joints(selection==1?22:selection==2?34:30);
+}
+std::vector<JointPose> rest_pose(const SkeletonDef *s, float height) {
+    std::vector<float> q(s->joint_count()*4,0.f);
+    for(size_t j=0;j<s->joint_count();++j) q[j*4+3]=1.f;
+    float root[3]={0,height,0};
+    return evaluate_frame_fk(0,1,static_cast<int>(s->joint_count()),root,q.data(),s);
+}
+static PRM_Name skeleton_name("skeleton","Skeleton");
+static PRM_Name skeleton_choices[]={PRM_Name("soma30","SOMA 30"),PRM_Name("smplx22","SMPL-X 22"),PRM_Name("g1skel34","Unitree G1 34"),PRM_Name()};
+static PRM_ChoiceList skeleton_menu(PRM_CHOICELIST_SINGLE,skeleton_choices);
+static PRM_Default zero(0),one(1),height_default(1.0),frames_default(60),steps_default(50),seed_default(42),cfg_default(2);
+static PRM_Name height_name("root_height","Root Height (m)");
+class SOP_KimodoSkeleton final : public SOP_Node {
+public:
+    SOP_KimodoSkeleton(OP_Network *n,const char *s,OP_Operator *o):SOP_Node(n,s,o){}
+    static OP_Node *create(OP_Network *n,const char *s,OP_Operator *o){return new SOP_KimodoSkeleton(n,s,o);}
+    static PRM_Template parms[];
+    OP_ERROR cookMySop(OP_Context &c) override {
+        const auto *s=selected_skeleton(evalInt("skeleton",0,c.getTime()));
+        write_skeleton(gdp,rest_pose(s,evalFloat("root_height",0,c.getTime())),s,true);
+        return error();
+    }
+};
+PRM_Template SOP_KimodoSkeleton::parms[]={
+    PRM_Template(PRM_ORD,1,&skeleton_name,&zero,&skeleton_menu),
+    PRM_Template(PRM_FLT,1,&height_name,&height_default),PRM_Template()};
+
+static PRM_Name prompt_name("prompt","Text Prompt"),frames_name("frames","Frame Count"),start_name("start_frame","Start Frame"),steps_name("steps","Diffusion Steps"),seed_name("seed","Seed");
+static PRM_Name text_cfg_name("text_cfg","Text CFG Weight"),constraint_cfg_name("constraint_cfg","Constraint CFG Weight");
+static PRM_Name model_name("motion_model","Motion GGUF Path"),text_model_name("text_model","Text Encoder GGUF / Bundle"),device_name("device","Motion Compute Backend"),bones_name("connect_bones","Create KineFX Bone Lines");
+static PRM_Default prompt_default(0,"A person walking forward and waving"),model_default(0,"$KIMODO_MODEL_DIR/models/kimodo-soma-rp-v1.1-f32.gguf"),text_model_default(0,"$KIMODO_MODEL_DIR/Llama-3-Kimodo-Q8_0.gguf");
+static PRM_Name device_choices[]={PRM_Name("auto","Auto"),PRM_Name("cpu","CPU"),PRM_Name("vulkan","Vulkan GPU"),PRM_Name()};
+static PRM_ChoiceList device_menu(PRM_CHOICELIST_SINGLE,device_choices);
+static PRM_Name generate_name("generate","Generate"),capture_name("capture_frames","Capture Frames"),source_name("capture_source","Capture Frames From"),capture_attr_name("capture_attribute","Capture Frame Detail Attribute"),mode_name("capture_mode","Pose Capture Mode"),group_name("capture_group","Joint Point Group"),rot_name("capture_rotations","Constrain Selected Joint Rotations"),path_name("waypoint_mode","Waypoint Mode");
+static PRM_Default attr_default(0,"kimodo_capture_frames"),empty_default(0,""),merge_default(2);
+static PRM_Name source_choices[]={PRM_Name("ui","UI Frame List"),PRM_Name("attribute","Detail Attribute"),PRM_Name("merge","UI + Detail Attribute"),PRM_Name()};
+static PRM_Name mode_choices[]={PRM_Name("full","Full Body"),PRM_Name("selected","Selected Joints"),PRM_Name()};
+static PRM_Name path_choices[]={PRM_Name("sparse","Sparse Waypoints"),PRM_Name("dense","Dense Path (Linear Interpolation)"),PRM_Name()};
+static PRM_ChoiceList source_menu(PRM_CHOICELIST_SINGLE,source_choices),mode_menu(PRM_CHOICELIST_SINGLE,mode_choices),path_menu(PRM_CHOICELIST_SINGLE,path_choices);
+static PRM_Range frame_range(PRM_RANGE_RESTRICTED,2,PRM_RANGE_UI,300),step_range(PRM_RANGE_RESTRICTED,1,PRM_RANGE_UI,100);
 }
 
-// Houdini 21+ operator registration entry point
+PRM_Template SOP_Kimodo::myTemplateList[]={
+    PRM_Template(PRM_CALLBACK,1,&generate_name,nullptr,nullptr,nullptr,&SOP_Kimodo::generateCallback),
+    PRM_Template(PRM_STRING,1,&prompt_name,&prompt_default),
+    PRM_Template(PRM_INT,1,&start_name,&one),
+    PRM_Template(PRM_INT,1,&frames_name,&frames_default,nullptr,&frame_range),
+    PRM_Template(PRM_INT,1,&steps_name,&steps_default,nullptr,&step_range),
+    PRM_Template(PRM_INT,1,&seed_name,&seed_default),
+    PRM_Template(PRM_FLT,1,&text_cfg_name,&cfg_default),
+    PRM_Template(PRM_FLT,1,&constraint_cfg_name,&cfg_default),
+    PRM_Template(PRM_ORD,1,&skeleton_name,&zero,&skeleton_menu),
+    PRM_Template(PRM_ORD,1,&source_name,&merge_default,&source_menu),
+    PRM_Template(PRM_STRING,1,&capture_name,&empty_default),
+    PRM_Template(PRM_STRING,1,&capture_attr_name,&attr_default),
+    PRM_Template(PRM_ORD,1,&mode_name,&zero,&mode_menu),
+    PRM_Template(PRM_STRING,1,&group_name,&empty_default),
+    PRM_Template(PRM_TOGGLE,1,&rot_name,&one),
+    PRM_Template(PRM_ORD,1,&path_name,&zero,&path_menu),
+    PRM_Template(PRM_FILE,1,&model_name,&model_default),
+    PRM_Template(PRM_FILE,1,&text_model_name,&text_model_default),
+    PRM_Template(PRM_ORD,1,&device_name,&zero,&device_menu),
+    PRM_Template(PRM_TOGGLE,1,&bones_name,&one),PRM_Template()};
+
+OP_Node *SOP_Kimodo::myConstructor(OP_Network *n,const char *s,OP_Operator *o){return new SOP_Kimodo(n,s,o);}
+SOP_Kimodo::SOP_Kimodo(OP_Network *n,const char *s,OP_Operator *o):SOP_Node(n,s,o){}
+SOP_Kimodo::~SOP_Kimodo()=default;
+const char *SOP_Kimodo::inputLabel(OP_InputIdx i) const {return i==0?"Animated KineFX Skeleton / Pose Captures":"Waypoints (P, integer frame; optional heading in radians)";}
+int SOP_Kimodo::generateCallback(void *op,int,fpreal time,const PRM_Template *) {
+    auto *node=static_cast<SOP_Kimodo *>(op);
+    node->myGenerateRequested=true;
+    node->forceRecook();
+    OP_Context context(time);
+    node->cook(context);
+    return 1;
+}
+
+OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
+    flags().setTimeDep(true);
+    const fpreal t=context.getTime();
+    auto text=[&](const char *name){UT_String s;evalString(s,name,0,t);return std::string(s.c_str()?s.c_str():"");};
+    if(std::exchange(myGenerateRequested,false)) {
+        try {
+            const int frames=evalInt("frames",0,t),start=evalInt("start_frame",0,t);
+            const auto *s=selected_skeleton(evalInt("skeleton",0,t));
+            if(frames<2 || frames>10000) throw std::runtime_error("Frame count must be between 2 and 10000");
+            std::set<int> capture_frames;
+            const int source=evalInt("capture_source",0,t);
+            if(source!=1) {auto list=parse_capture_frames(text("capture_frames"),start,frames);capture_frames.insert(list.begin(),list.end());}
+            if(getInput(0) && source!=0) {
+                OP_AutoLockInputs lock(this);
+                if(lock.lockInput(0,context)>=UT_ERROR_ABORT) throw std::runtime_error("Cannot cook pose input");
+                const auto *geo=inputGeo(0);
+                const std::string attr_name=text("capture_attribute");
+                const auto *attr=geo->findGlobalAttribute(attr_name.c_str());
+                if(!attr && source==1) throw std::runtime_error("Missing capture-frame detail attribute: "+attr_name);
+                if(attr) {
+                    GA_ROHandleIA ints(attr);GA_ROHandleS str(attr);
+                    std::string list;
+                    if(ints.isValid()) {UT_Int32Array a;ints.get(GA_Offset(0),a);for(auto f:a) list+=std::to_string(f)+" ";}
+                    else if(str.isValid()) list=str.get(GA_Offset(0)).c_str();
+                    else throw std::runtime_error("Capture-frame detail attribute must be an integer array or string");
+                    auto parsed=parse_capture_frames(list,start,frames);capture_frames.insert(parsed.begin(),parsed.end());
+                }
+            }
+            if(!getInput(0) && !capture_frames.empty()) throw std::runtime_error("Capture frames require a skeleton on input 0");
+            std::vector<PoseCapture> poses;
+            for(int frame:capture_frames) {
+                OP_Context capture_context=context;capture_context.setFrame(frame);
+                OP_AutoLockInputs lock(this);
+                if(lock.lockInput(0,capture_context)>=UT_ERROR_ABORT) throw std::runtime_error("Cannot cook pose input at frame "+std::to_string(frame));
+                const auto *geo=inputGeo(0);
+                GA_ROHandleS names(geo->findPointAttribute("name"));
+                if(!names.isValid()) throw std::runtime_error("Input 0 requires string point attribute name");
+                std::map<std::string,GA_Offset> points;
+                for(GA_Iterator it(geo->getPointRange());!it.atEnd();++it)
+                    if(!points.emplace(names.get(*it).c_str(),*it).second) throw std::runtime_error("Duplicate joint name on input 0");
+                const bool selected=evalInt("capture_mode",0,t)==1;
+                const GA_PointGroup *group=nullptr;
+                if(selected) {group=geo->findPointGroup(text("capture_group").c_str());if(!group || group->isEmpty()) throw std::runtime_error("Selected-joint capture requires a nonempty point group on input 0");}
+                PoseCapture p;p.frame=frame-start;p.rotations=selected && evalInt("capture_rotations",0,t);
+                GA_ROHandleM3 transforms(geo->findPointAttribute("transform"));
+                if(p.rotations && !transforms.isValid()) throw std::runtime_error("Rotation capture requires KineFX point matrix3 transform");
+                for(auto name:s->names) {
+                    auto it=points.find(std::string(name));
+                    if(it==points.end()) throw std::runtime_error("Input skeleton is missing joint: "+std::string(name));
+                    const auto P=geo->getPos3(it->second);p.positions.push_back({float(P.x()),float(P.y()),float(P.z())});
+                    p.selected.push_back(!selected || group->contains(it->second));
+                    if(p.rotations) {
+                        const UT_Matrix3F m=transforms.get(it->second);
+                        std::array<float,9> a{};for(int r=0;r<3;++r)for(int c=0;c<3;++c)a[r*3+c]=m(r,c);
+                        p.transforms.push_back(a);
+                    }
+                }
+                if(std::none_of(p.selected.begin(),p.selected.end(),[](bool v){return v;})) throw std::runtime_error("Joint group contains no model joints");
+                poses.push_back(std::move(p));
+            }
+            std::vector<Waypoint> waypoints;
+            if(getInput(1)) {
+                OP_AutoLockInputs lock(this);
+                if(lock.lockInput(1,context)>=UT_ERROR_ABORT) throw std::runtime_error("Cannot cook waypoint input");
+                const auto *geo=inputGeo(1);const auto *attr=geo->findPointAttribute("frame");
+                if(!attr || attr->getStorageClass()!=GA_STORECLASS_INT || attr->getTupleSize()!=1) throw std::runtime_error("Input 1 requires scalar integer point attribute frame");
+                GA_ROHandleI frame_attr(attr);GA_ROHandleF heading(geo->findPointAttribute("heading"));
+                for(GA_Iterator it(geo->getPointRange());!it.atEnd();++it) {
+                    const auto P=geo->getPos3(*it);
+                    waypoints.push_back({frame_attr.get(*it)-start,float(P.x()),float(P.z()),heading.isValid(),heading.isValid()?heading.get(*it):0.f});
+                }
+                if(waypoints.empty()) throw std::runtime_error("Waypoint input contains no points");
+            }
+            auto constraints=make_conditioning(*s,frames,poses,waypoints,evalInt("waypoint_mode",0,t)==1);
+            auto view=constraints.view();
+            ModelConfig model;model.motion_gguf=text("motion_model");model.text_gguf=text("text_model");model.device=static_cast<kimodo_device>(evalInt("device",0,t));
+            GenerationParams params;params.prompt=text("prompt");params.frames=frames;params.diffusion_steps=evalInt("steps",0,t);params.seed=std::max<exint>(0,evalInt("seed",0,t));params.text_cfg_weight=evalFloat("text_cfg",0,t);params.constraint_cfg_weight=evalFloat("constraint_cfg",0,t);
+            std::string err;
+            const auto *motion=mySessionCache.get_or_generate(model,params,err,constraints.any?&view:nullptr,true);
+            if(!motion) throw std::runtime_error(err);
+            const int joints=kimodo_motion_joints(motion),actual_frames=kimodo_motion_frames(motion);
+            if(joints!=static_cast<int>(s->joint_count())) throw std::runtime_error("Selected skeleton does not match the loaded motion model");
+            std::vector<float> roots(kimodo_motion_root_positions(motion),kimodo_motion_root_positions(motion)+actual_frames*3);
+            std::vector<float> rotations(kimodo_motion_local_rotations_xyzw(motion),kimodo_motion_local_rotations_xyzw(motion)+actual_frames*joints*4);
+            myRoots=std::move(roots);myRotations=std::move(rotations);myFrames=actual_frames;myJoints=joints;myStart=start;++myGeneration;
+            myLastError.clear();
+        } catch(const std::exception &e) {myLastError=e.what();}
+    }
+    if(myFrames) {
+        const int frame=SYSclamp(int(context.getFrame())-myStart,0,myFrames-1);
+        const auto *s=find_skeleton_by_joints(myJoints);
+        write_skeleton(gdp,evaluate_frame_fk(frame,myFrames,myJoints,myRoots.data(),myRotations.data(),s),s,evalInt("connect_bones",0,t));
+    } else {
+        const auto *s=selected_skeleton(evalInt("skeleton",0,t));
+        write_skeleton(gdp,rest_pose(s,1.f),s,evalInt("connect_bones",0,t));
+        addWarning(SOP_MESSAGE,"No generated clip. Configure inputs and press Generate.");
+    }
+    GA_RWHandleI(gdp->addIntTuple(GA_ATTRIB_DETAIL,"kimodo_generation",1)).set(GA_Offset(0),myGeneration);
+    GA_RWHandleI(gdp->addIntTuple(GA_ATTRIB_DETAIL,"kimodo_clip_frames",1)).set(GA_Offset(0),myFrames);
+    if(!myLastError.empty()) addWarning(SOP_MESSAGE,myLastError.c_str());
+    return error();
+}
 void newSopOperator(OP_OperatorTable *table) {
-    table->addOperator(new OP_Operator(
-        "sop_kimodo_native",
-        "Kimodo Native",
-        SOP_Kimodo::myConstructor,
-        SOP_Kimodo::myTemplateList,
-        0u,
-        0u // Pure text-to-motion generator SOP requires 0 geometric inputs
-    ));
+    table->addOperator(new OP_Operator("sop_kimodo_native","Kimodo Native",SOP_Kimodo::myConstructor,SOP_Kimodo::myTemplateList,0u,2u));
+    table->addOperator(new OP_Operator("sop_kimodo_skeleton","Kimodo Skeleton",SOP_KimodoSkeleton::create,SOP_KimodoSkeleton::parms,0u,0u));
 }

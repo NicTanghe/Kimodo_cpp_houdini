@@ -15,6 +15,11 @@ if(NOT EXISTS "${KIMODO_CPP_DIR}/include/kimodo/kimodo_capi.h")
     message(FATAL_ERROR "kimodo.cpp headers not found at ${KIMODO_CPP_DIR}/include/kimodo/kimodo_capi.h")
 endif()
 
+file(READ "${KIMODO_CPP_DIR}/include/kimodo/kimodo_capi.h" KIMODO_CAPI_HEADER)
+if(NOT KIMODO_CAPI_HEADER MATCHES "kimodo_generate_conditioned")
+    message(FATAL_ERROR "Apply patches/kimodo-split-backends.patch and patches/kimodo-constraints.patch to the pinned kimodo.cpp checkout first (see README.md).")
+endif()
+
 set(GGML_LIB_DIR "${KIMODO_CPP_BUILD_DIR}/ggml/src")
 set(GGML_VK_LIB_DIR "${KIMODO_CPP_BUILD_DIR}/ggml/src/ggml-vulkan")
 

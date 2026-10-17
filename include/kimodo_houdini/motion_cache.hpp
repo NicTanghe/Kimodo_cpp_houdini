@@ -78,7 +78,9 @@ public:
     const kimodo_motion *get_or_generate(
         const ModelConfig &model_cfg,
         const GenerationParams &gen_params,
-        std::string &out_error) {
+        std::string &out_error,
+        const kimodo_conditioning *conditioning = nullptr,
+        bool force = false) {
 
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -86,7 +88,7 @@ public:
             return nullptr;
         }
 
-        if (motion_ && has_cached_params_ && cached_gen_params_ == gen_params) {
+        if (!force && !conditioning && motion_ && has_cached_params_ && cached_gen_params_ == gen_params) {
             return motion_;
         }
 
@@ -101,7 +103,11 @@ public:
         opts.constraint_cfg_weight = gen_params.constraint_cfg_weight;
 
         char err_buf[1024]{};
-        if (!model_cfg.text_gguf.empty()) {
+        if (conditioning) {
+            motion_ = kimodo_generate_conditioned(model_,
+                model_cfg.text_gguf.empty() ? nullptr : gen_params.prompt.c_str(),
+                &opts, conditioning, err_buf, sizeof(err_buf));
+        } else if (!model_cfg.text_gguf.empty()) {
             motion_ = kimodo_generate(
                 model_,
                 gen_params.prompt.c_str(),
