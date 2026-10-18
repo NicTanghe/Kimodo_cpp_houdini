@@ -8,6 +8,8 @@ import hou
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--models', type=Path, required=True)
+parser.add_argument('--device', choices=('cpu', 'vulkan'), default='vulkan')
+parser.add_argument('--steps', type=int, default=20)
 parser.add_argument('--save', type=Path)
 args = parser.parse_args()
 hou.setFrame(1)
@@ -19,16 +21,12 @@ assert skeleton.geometry().findPointAttrib('transform').size() == 9
 animated = geo.createNode('xform', 'animate_skeleton_with_native_tools')
 animated.setInput(0, skeleton)
 animated.parm('tx').setExpression('($F-1)/29')
-metadata = geo.createNode('python', 'capture_frames_and_hand_group')
+metadata = geo.createNode('python', 'capture_frames')
 metadata.setInput(0, animated)
 metadata.parm('python').set('''import hou
 g = hou.pwd().geometry()
 g.addArrayAttrib(hou.attribType.Global, "kimodo_capture_frames", hou.attribData.Int)
 g.setGlobalAttribValue("kimodo_capture_frames", [15])
-group = g.createPointGroup("hands")
-for p in g.points():
-    if p.attribValue("name") in ("LeftHand", "RightHand"):
-        group.add(p)
 ''')
 waypoints = geo.createNode('python', 'timed_waypoints')
 waypoints.parm('python').set('''import hou
@@ -41,8 +39,8 @@ for frame, x in [(1, 0.), (30, 1.)]:
 ''')
 node = geo.createNode('sop_kimodo_native', 'generate_motion')
 node.setParms({'motion_model': str(args.models/'models/kimodo-soma-rp-v1.1-f32.gguf'),
-               'text_model': '', 'device': 2, 'frames': 30, 'steps': 20})
-node.setInput(0, skeleton)  # Empty capture list means no pose constraints.
+               'text_model': '', 'device': 1 if args.device == 'cpu' else 2, 'frames': 30, 'steps': args.steps})
+node.setInput(0, skeleton)  # Pose locks default off, even with an input connected.
 assert node.geometry().attribValue('kimodo_generation') == 0
 node.parm('prompt').set('This edit must not generate')
 hou.setFrame(12)
@@ -63,7 +61,7 @@ generate(1)
 baseline = snapshot()
 node.setInput(0, metadata)
 node.setInput(1, waypoints)
-node.setParms({'capture_frames': '1 30', 'capture_source': 2})
+node.setParms({'enable_pose_locks': 1, 'enable_waypoints': 1, 'capture_frames': '1 30', 'capture_source': 2})
 assert snapshot() == baseline
 assert node.geometry().attribValue('kimodo_generation') == 1
 generate(2)
@@ -72,7 +70,7 @@ assert conditioned != baseline, 'Constraints must affect inference'
 node.parm('seed').set(123)
 assert snapshot() == conditioned
 assert node.geometry().attribValue('kimodo_generation') == 2
-node.setParms({'capture_mode': 1, 'capture_group': 'hands', 'capture_source': 1})
+node.setParms({'capture_mode': 1, 'capture_group': '@name=LeftHand @name=RightHand', 'capture_source': 1})
 generate(3)
 selected = snapshot()
 assert selected != conditioned
@@ -83,8 +81,8 @@ node.parm('capture_group').set('missing_group')
 node.parm('generate').pressButton()
 assert node.geometry().attribValue('kimodo_generation') == 4
 assert snapshot() == dense
-assert any('point group' in warning for warning in node.warnings()), node.warnings()
-node.parm('capture_group').set('hands')
+assert any('Locked Joints' in warning for warning in node.warnings()), node.warnings()
+node.parm('capture_group').set('@name=LeftHand @name=RightHand')
 node.setParms({'capture_source': 0, 'capture_frames': '0'})
 node.parm('generate').pressButton()
 assert node.geometry().attribValue('kimodo_generation') == 4

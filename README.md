@@ -232,6 +232,12 @@ and animate it using Rig Pose or other native KineFX tools.
 Connect the animated skeleton to **input 0** of **Kimodo Native**, and waypoint
 points to **input 1**. Choose the matching **Skeleton** on both nodes and a motion
 model for that skeleton. Captures are matched by joint `name`, not point order.
+Turn on **Enable Pose Locks** and/or **Enable Waypoints** to use those inputs.
+Both checkboxes default off and hide their related controls when disabled.
+Disabled inputs are ignored, including their parameters and upstream cooks.
+Changing a checkbox or selection takes effect only when you click **Generate**;
+the existing clip stays available until then. When opening older scenes, enable
+the checkboxes for the constraints you want to use.
 All positions are SOP-space, Y-up, in meters. Use Object Merge transforms when
 bringing inputs from different objects. The model produces 30 motion samples per
 second; a 30 FPS Houdini scene plays those samples at their intended speed.
@@ -255,16 +261,20 @@ Set **Capture Frames From** to the UI list, detail attribute, or their union:
 
 The node cooks input 0 separately at every selected frame **when Generate is
 pressed** and snapshots the poses. It does not use the currently displayed pose
-for every capture. An empty list means no pose constraints; frame numbers without
-input 0 are rejected. Duplicate capture frames are merged.
+for every capture. Enabled pose locks require input 0 and at least one capture
+frame. Duplicate capture frames are merged.
 
 For in-betweening, capture the beginning and ending poses, or ranges at both ends
 (e.g. `1-10 51-60`), then let Kimodo generate the motion between them.
 
 **Full Body** constrains all joint positions and the root position/heading, as in
-NVIDIA's FullBodyConstraintSet. **Selected Joints** uses a named **Joint Point
-Group** on input 0; create that group with native Group tools. The full named
-skeleton must remain present. Selected positions are constrained, and enabling
+NVIDIA's FullBodyConstraintSet. For **Selected Joints**, click the viewport
+selection button beside **Locked Joints**, select joints on input 0, and press
+Enter, using the same name-based picker as KineFX Rig Pose. No point group needs
+to be created. Selections are stored as expressions such as
+`@name=LeftHand @name=RightHand`, so they survive point reordering. Existing named
+group expressions are still accepted. The full named skeleton must remain
+present. Selected positions are constrained, and enabling
 **Constrain Selected Joint Rotations** also reads their world-space KineFX
 `transform` matrices. Root position/heading are constrained in this mode too, as
 required by the smooth-root representation. Hand and foot constraints are the
@@ -344,6 +354,9 @@ KIMODO_TEXT_BACKEND=cpu KIMODO_PROFILE=1 "$HFS/bin/hython" tests/houdini_smoke.p
 ```
 
 The profile output should show `text.backend=CPU` and `motion.backend=Vulkan0`.
+The pinned Kimodo runtime exposes CPU and Vulkan devices only. Its bundled GGML
+has CUDA source support, but CUDA is not wired into Kimodo's device selection or
+this plugin's build; installing a CUDA toolkit alone will not enable it.
 The check verifies real inference, skeleton topology, attributes, finite positions,
 and timeline updates. It uses only four diffusion steps as a smoke test; increase
 the node's diffusion steps for production animation.
@@ -359,3 +372,13 @@ It checks UI/array/string frame capture, full and selected-joint constraints,
 waypoints and dense paths, button-only generation, and preservation of the last
 clip after invalid input. The saved authoring network requires Generate after
 opening because the inference cache is not serialized.
+
+Run the checkbox and joint-selection regression:
+
+```bash
+"$HFS/bin/hython" tests/houdini_constraint_controls.py --models "$KIMODO_CPP_DIR"
+```
+
+This checks conditional parameter visibility, the Rig Pose picker callback,
+name-based locks without point groups, and ignored disabled inputs. It validates
+the picker wiring without opening an interactive viewport selector.

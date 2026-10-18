@@ -13,6 +13,7 @@ protected:
     SOP_Kimodo(OP_Network *,const char *,OP_Operator *);
     ~SOP_Kimodo() override;
     OP_ERROR cookMySop(OP_Context &) override;
+    bool updateParmsFlags() override;
 private:
     kimodo_houdini::KimodoSessionCache mySessionCache;
     bool myGenerateRequested=false;

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <OP/OP_AutoLockInputs.h>
+#include <CH/CH_Manager.h>
 #include <GA/GA_ElementGroup.h>
 #include <kimodo_houdini/constraints.hpp>
 #include <map>
@@ -137,7 +138,16 @@ static PRM_Name model_name("motion_model","Motion GGUF Path"),text_model_name("t
 static PRM_Default prompt_default(0,"A person walking forward and waving"),model_default(0,"$KIMODO_MODEL_DIR/models/kimodo-soma-rp-v1.1-f32.gguf"),text_model_default(0,"$KIMODO_MODEL_DIR/Llama-3-Kimodo-Q8_0.gguf");
 static PRM_Name device_choices[]={PRM_Name("auto","Auto"),PRM_Name("cpu","CPU"),PRM_Name("vulkan","Vulkan GPU"),PRM_Name()};
 static PRM_ChoiceList device_menu(PRM_CHOICELIST_SINGLE,device_choices);
-static PRM_Name generate_name("generate","Generate"),capture_name("capture_frames","Capture Frames"),source_name("capture_source","Capture Frames From"),capture_attr_name("capture_attribute","Capture Frame Detail Attribute"),mode_name("capture_mode","Pose Capture Mode"),group_name("capture_group","Joint Point Group"),rot_name("capture_rotations","Constrain Selected Joint Rotations"),path_name("waypoint_mode","Waypoint Mode");
+static PRM_Name generate_name("generate","Generate"),capture_name("capture_frames","Capture Frames"),source_name("capture_source","Capture Frames From"),capture_attr_name("capture_attribute","Capture Frame Detail Attribute"),mode_name("capture_mode","Pose Capture Mode"),group_name("capture_group","Locked Joints"),rot_name("capture_rotations","Constrain Selected Joint Rotations"),path_name("waypoint_mode","Waypoint Mode");
+static PRM_Name pose_enable_name("enable_pose_locks", "Enable Pose Locks");
+static PRM_Name waypoint_enable_name("enable_waypoints", "Enable Waypoints");
+// Same name-based viewport picker used by KineFX Rig Pose. Keep capture_group's
+// internal token so existing selections in saved scenes continue to load.
+static PRM_SpareData joint_picker(PRM_SpareArgs()
+    << PRM_SpareToken("script_action", "import soputils\nsoputils.selectPointGroupParmByName(kwargs, inputindex=0)\n")
+    << PRM_SpareToken("script_action_icon", "BUTTONS_reselect")
+    << PRM_SpareToken("script_action_help", "Select joints on input 0 in the viewport, then press Enter. Selections are stored by joint name.")
+    << PRM_SpareToken("script_callback_language", "python"));
 static PRM_Default attr_default(0,"kimodo_capture_frames"),empty_default(0,""),merge_default(2);
 static PRM_Name source_choices[]={PRM_Name("ui","UI Frame List"),PRM_Name("attribute","Detail Attribute"),PRM_Name("merge","UI + Detail Attribute"),PRM_Name()};
 static PRM_Name mode_choices[]={PRM_Name("full","Full Body"),PRM_Name("selected","Selected Joints"),PRM_Name()};
@@ -156,12 +166,14 @@ PRM_Template SOP_Kimodo::myTemplateList[]={
     PRM_Template(PRM_FLT,1,&text_cfg_name,&cfg_default),
     PRM_Template(PRM_FLT,1,&constraint_cfg_name,&cfg_default),
     PRM_Template(PRM_ORD,1,&skeleton_name,&zero,&skeleton_menu),
+    PRM_Template(PRM_TOGGLE,1,&pose_enable_name,&zero),
     PRM_Template(PRM_ORD,1,&source_name,&merge_default,&source_menu),
     PRM_Template(PRM_STRING,1,&capture_name,&empty_default),
     PRM_Template(PRM_STRING,1,&capture_attr_name,&attr_default),
     PRM_Template(PRM_ORD,1,&mode_name,&zero,&mode_menu),
-    PRM_Template(PRM_STRING,1,&group_name,&empty_default),
+    PRM_Template(PRM_STRING,1,&group_name,&empty_default,nullptr,nullptr,nullptr,&joint_picker),
     PRM_Template(PRM_TOGGLE,1,&rot_name,&one),
+    PRM_Template(PRM_TOGGLE,1,&waypoint_enable_name,&zero),
     PRM_Template(PRM_ORD,1,&path_name,&zero,&path_menu),
     PRM_Template(PRM_FILE,1,&model_name,&model_default),
     PRM_Template(PRM_FILE,1,&text_model_name,&text_model_default),
@@ -172,6 +184,28 @@ OP_Node *SOP_Kimodo::myConstructor(OP_Network *n,const char *s,OP_Operator *o){r
 SOP_Kimodo::SOP_Kimodo(OP_Network *n,const char *s,OP_Operator *o):SOP_Node(n,s,o){}
 SOP_Kimodo::~SOP_Kimodo()=default;
 const char *SOP_Kimodo::inputLabel(OP_InputIdx i) const {return i==0?"Animated KineFX Skeleton / Pose Captures":"Waypoints (P, integer frame; optional heading in radians)";}
+bool SOP_Kimodo::updateParmsFlags() {
+    bool changed = SOP_Node::updateParmsFlags();
+    const fpreal time = CHgetEvalTime();
+    const bool poses = evalInt("enable_pose_locks", 0, time) != 0;
+    const bool waypoints = evalInt("enable_waypoints", 0, time) != 0;
+    const bool selected = poses && evalInt("capture_mode", 0, time) == 1;
+    const int source = evalInt("capture_source", 0, time);
+    auto show = [&](const char *name, bool visible) {
+        changed |= setVisibleState(name, visible);
+        changed |= enableParm(name, visible);
+    };
+    show("capture_source", poses);
+    show("capture_frames", poses && source != 1);
+    show("capture_attribute", poses && source != 0);
+    show("capture_mode", poses);
+    show("capture_group", selected);
+    show("capture_rotations", selected);
+    show("waypoint_mode", waypoints);
+    show("constraint_cfg", poses || waypoints);
+    return changed;
+}
+
 int SOP_Kimodo::generateCallback(void *op,int,fpreal time,const PRM_Template *) {
     auto *node=static_cast<SOP_Kimodo *>(op);
     node->myGenerateRequested=true;
@@ -190,10 +224,16 @@ OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
             const int frames=evalInt("frames",0,t),start=evalInt("start_frame",0,t);
             const auto *s=selected_skeleton(evalInt("skeleton",0,t));
             if(frames<2 || frames>10000) throw std::runtime_error("Frame count must be between 2 and 10000");
+            const bool pose_enabled = evalInt("enable_pose_locks", 0, t) != 0;
+            const bool waypoint_enabled = evalInt("enable_waypoints", 0, t) != 0;
+            if (pose_enabled && !getInput(0))
+                throw std::runtime_error("Pose locks require an animated skeleton on input 0");
+            if (waypoint_enabled && !getInput(1))
+                throw std::runtime_error("Waypoints require points on input 1");
             std::set<int> capture_frames;
             const int source=evalInt("capture_source",0,t);
-            if(source!=1) {auto list=parse_capture_frames(text("capture_frames"),start,frames);capture_frames.insert(list.begin(),list.end());}
-            if(getInput(0) && source!=0) {
+            if(pose_enabled && source!=1) {auto list=parse_capture_frames(text("capture_frames"),start,frames);capture_frames.insert(list.begin(),list.end());}
+            if(pose_enabled && getInput(0) && source!=0) {
                 OP_AutoLockInputs lock(this);
                 if(lock.lockInput(0,context)>=UT_ERROR_ABORT) throw std::runtime_error("Cannot cook pose input");
                 const auto *geo=inputGeo(0);
@@ -210,6 +250,8 @@ OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
                 }
             }
             if(!getInput(0) && !capture_frames.empty()) throw std::runtime_error("Capture frames require a skeleton on input 0");
+            if (pose_enabled && capture_frames.empty())
+                throw std::runtime_error("Specify capture frames for the enabled pose locks");
             std::vector<PoseCapture> poses;
             for(int frame:capture_frames) {
                 OP_Context capture_context=context;capture_context.setFrame(frame);
@@ -223,7 +265,16 @@ OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
                     if(!points.emplace(names.get(*it).c_str(),*it).second) throw std::runtime_error("Duplicate joint name on input 0");
                 const bool selected=evalInt("capture_mode",0,t)==1;
                 const GA_PointGroup *group=nullptr;
-                if(selected) {group=geo->findPointGroup(text("capture_group").c_str());if(!group || group->isEmpty()) throw std::runtime_error("Selected-joint capture requires a nonempty point group on input 0");}
+                if (selected) {
+                    const std::string selection = text("capture_group");
+                    // Empty Houdini group expressions mean all points; here an
+                    // empty Locked Joints field must never accidentally lock all.
+                    if (selection.find_first_not_of(" \t\r\n") == std::string::npos)
+                        throw std::runtime_error("Select Locked Joints using the viewport picker");
+                    group = parsePointGroups(selection.c_str(), GroupCreator(geo), true, false);
+                    if (!group || group->isEmpty())
+                        throw std::runtime_error("Locked Joints selection does not match input 0");
+                }
                 PoseCapture p;p.frame=frame-start;p.rotations=selected && evalInt("capture_rotations",0,t);
                 GA_ROHandleM3 transforms(geo->findPointAttribute("transform"));
                 if(p.rotations && !transforms.isValid()) throw std::runtime_error("Rotation capture requires KineFX point matrix3 transform");
@@ -238,11 +289,11 @@ OP_ERROR SOP_Kimodo::cookMySop(OP_Context &context) {
                         p.transforms.push_back(a);
                     }
                 }
-                if(std::none_of(p.selected.begin(),p.selected.end(),[](bool v){return v;})) throw std::runtime_error("Joint group contains no model joints");
+                if(std::none_of(p.selected.begin(),p.selected.end(),[](bool v){return v;})) throw std::runtime_error("Locked Joints selection contains no model joints");
                 poses.push_back(std::move(p));
             }
             std::vector<Waypoint> waypoints;
-            if(getInput(1)) {
+            if(waypoint_enabled && getInput(1)) {
                 OP_AutoLockInputs lock(this);
                 if(lock.lockInput(1,context)>=UT_ERROR_ABORT) throw std::runtime_error("Cannot cook waypoint input");
                 const auto *geo=inputGeo(1);const auto *attr=geo->findPointAttribute("frame");
